@@ -1,6 +1,6 @@
 ---
 title: "Titanic ML"
-author: "Timothy Ripper"
+author: "Teoshen"
 format: html
 editor: visual
 ---
