@@ -1,0 +1,443 @@
+---
+title: "Titanic ML"
+author: "Teoshen"
+format: html
+editor: visual
+---
+
+```{r}
+#libraries
+echo=FALSE
+library(readxl)
+library(ggplot2)
+library(caret)
+library(MASS)
+library(dslabs)
+library(tidyverse)
+library(randomForest)
+library(Rborist)
+library(caretEnsemble)
+library(rpart.plot)
+```
+
+## Section 1: Loading the data
+
+```{r}
+
+test_base <- read.csv("C:/Users/timot/Downloads/test.csv")
+gender_submission <- read.csv("C:/Users/timot/Downloads/gender_submission.csv")
+train_base <- read.csv("C:/Users/timot/Downloads/train.csv")
+
+View(gender_submission)
+View(test_base)
+View(train_base)
+```
+
+##  Section 2: Descriptive Statistics
+
+Our goal here is to get a feel for the data - what trends we should expect to see.
+
+First thing to check is just how many people survived - what our baseline guess could be if we say that everyone either survived or died, and try to beat that number.
+
+```{r}
+train_base %>%
+  count(Survived) %>%
+ggplot(aes(x = Survived, y = n, fill = factor(Survived))) +
+  geom_bar(stat = 'identity')
+```
+
+In general, we should expect about half again as many people to die as to survive. This means that guessing everyone dies would give about 75% accuracy.
+
+Second, survival rates by sex.
+
+```{r}
+train_base %>%
+  group_by(Sex, Survived) %>%
+  summarise(N = n()) %>%
+  ggplot(aes(x = Sex, y = N, fill = factor(Survived))) +
+  geom_bar(stat = 'identity')
+```
+
+This is not surprising that about 75% of women survive and about 15% of men survive.
+
+Third, survival rates by age.
+
+```{r}
+ggplot(train_base, aes(x = Age, fill = factor(Survived)), group = factor(Survived)) +
+  geom_histogram(color = "blue", binwidth = 5)
+```
+
+The info here is more spotty but very young seem to survive more often than older ones.
+
+Fourth, survival rates by class.
+
+```{r}
+train_base %>%
+  group_by(Pclass, Survived) %>%
+  summarise(N = n()) %>%
+  ggplot(aes(x = Pclass, y = N, fill = factor(Survived))) +
+  geom_bar(stat = 'identity')
+```
+
+Good data here. 1st and 2nd class do pretty well, and steerage does pretty poorly.
+
+I want to do a quick check to see if fare rates and class are about the same.
+
+```{r}
+ggplot(train_base, aes(x = Fare, fill = factor(Survived)), group = factor(Survived)) +
+  geom_histogram(color = "blue")
+```
+
+This looks like a pretty clear showing that people who paid higher fares are more likely to survive, but there's some outliers and the more expensive tickets don't have as many data points so that may not come up as significant in a stepwise.
+
+Last, I'm curious about embarking location and survival.
+
+```{r}
+train_base %>%
+  group_by(Embarked, Survived) %>%
+  summarise(N = n()) %>%
+  ggplot(aes(x = Embarked, y = N, fill = factor(Survived))) +
+  geom_bar(stat = 'identity')
+```
+
+Nothing too crazy here, maybe C is a little better than the others but nothing that is really shocking.
+
+My initial guess is that women in 1st and 2nd class, and their children around age 10 have the highest rate of survival, and that men in steerage have the worst rates.
+
+##  Section 3: Feature Engineering
+
+Section 4: Impute age.
+
+```{r}
+train_base$Age[is.na(train_base$Age)] <- mean(train_base$Age, na.rm = TRUE)
+
+test_base$Age[is.na(test_base$Age)] <- mean(test_base$Age, na.rm = TRUE)
+```
+
+Mother and Father flags.
+
+```{r}
+train_base <- train_base %>% 
+  mutate(Mother = ifelse(Age > 18 & Sex =="female" & Parch >= 1, "Mother", "Not"))
+train_base <- train_base %>% 
+  mutate(Father = ifelse(Age > 18 & Sex =="male" & Parch >= 1, "Father", "Not"))
+
+test_base <- test_base %>% 
+  mutate(Mother = ifelse(Age > 18 & Sex =="female" & Parch >= 1, "Mother", "Not"))
+test_base <- test_base %>% 
+  mutate(Father = ifelse(Age > 18 & Sex =="male" & Parch >= 1, "Father", "Not"))
+```
+
+Unaccompanied children and lone travelers
+
+```{r}
+train_base <- train_base %>% 
+  mutate(LoneChild = ifelse(Age < 18 & Parch == 0, "LoneChild", "Not"))
+train_base <- train_base %>%
+  mutate(LoneTravel = ifelse(Parch == 0 & SibSp == 0, "LoneTravel", "Not"))
+
+test_base <- test_base %>% 
+  mutate(LoneChild = ifelse(Age < 18 & Parch == 0, "LoneChild", "Not"))
+test_base <- test_base %>%
+  mutate(LoneTravel = ifelse(Parch == 0 & SibSp == 0, "LoneTravel", "Not"))
+```
+
+Unmarried adults without children.
+
+```{r}
+train_base <- train_base %>% 
+  mutate(Unmarried = ifelse(Age > 18 & Parch == 0 & SibSp == 0, "Unmarried", "Not"))
+
+test_base <- test_base %>% 
+  mutate(Unmarried = ifelse(Age > 18 & Parch == 0 & SibSp == 0, "Unmarried", "Not"))
+```
+
+Total family size.
+
+```{r}
+train_base <- train_base %>%
+  mutate(FamilySize = SibSp + Parch + 1)
+
+test_base <- test_base %>%
+  mutate(FamilySize = SibSp + Parch + 1)
+```
+
+This is similar to the other values but I'm curious if overall family size will give a different result.
+
+##  Section 4: Dealing with Missing Data
+
+Impute age by averaging NAs (done above to avoid NAs in feature selection).
+
+We will remove cabin number because I don't care for it as a data point and it's missing too many points to be useful at all.
+
+```{r}
+train_base <- train_base %>%
+  select(-Cabin)
+
+test_base <- test_base %>%
+  select(-Cabin)
+```
+
+We have one NA in fare to take care of as well. Since this person is in third class, we'll use an average of the other third class fares.
+
+```{r}
+which(is.na(test_base$Fare)) #line 153
+
+test_base %>%
+  filter(Pclass == 3) %>%
+  summarise(
+    fare = mean(Fare, na.rm = TRUE)) #12.45
+
+test_base[153,9] = 12.45
+  
+```
+
+## 
+ Section 5: Feature Selection
+
+Create our test index and training/testing set for the models.
+
+```{r}
+test_index <- createDataPartition(train_base$Survived, times = 1, p=0.5, list=FALSE) 
+test_set <- train_base[test_index,] 
+train_set <- train_base[-test_index,]
+```
+
+For each model type, we will do an analysis to see what features are working for us.
+
+#### GLM
+
+GLM gets a StepAIC
+
+```{r}
+train_glm <- glm(Survived ~ Age + factor(Pclass) + Sex + SibSp + Parch + Fare + Embarked + Mother + Father + LoneChild + LoneTravel + Unmarried + FamilySize, data = train_set, family = binomial) 
+stepAIC(train_glm, direction = "both")
+```
+
+So our values for the GLM model will be:
+
+```         
+Age + factor(Pclass) + Sex + SibSp + Embarked + LoneChild + LoneTravel
+```
+
+#### KNN
+
+KNN will use the values that the GLM model liked and check for best neighbors.
+
+```{r}
+train_knn <- train(Survived ~ Age + factor(Pclass) + Sex + SibSp + Parch + LoneTravel + Unmarried, method = "knn", data = train_set, tuneGrid = data.frame(k = seq(9, 71, 2)))
+
+ggplot(train_knn, highlight = TRUE)
+
+```
+
+```{r}
+train_knn$bestTune
+```
+
+Our N is 9
+
+#### Decision Tree
+
+```{r}
+train_dt <- train(Survived ~ ., method = "rpart", tuneGrid = data.frame(cp=seq(0,0.05, len = 25)), data = train_base)
+
+ggplot(train_dt, highlight = TRUE)
+
+```
+
+We will use a CP of 0.021.
+
+```{r}
+rpart.plot(train_dt$finalModel)
+```
+
+This does look pretty close to my initial predictions, so that's nice to see that I think like a simple decision tree.
+
+#### Random Forest
+
+```{r}
+train_rf <- train(Survived ~ factor(Pclass) + Sex + Age + SibSp + Parch + Fare + Embarked + Mother + Father + LoneChild + LoneTravel + Unmarried + FamilySize, method = "rf", tuneGrid = expand.grid(mtry = c(3,5)), data = train_base)
+```
+
+```{r}
+train_rf$bestTune
+```
+
+mtry = 3
+
+#### QDA
+
+```{r}
+#make train data a factor for qda
+train_base_qda <- train_base
+train_base_qda$Survived <- factor(train_base_qda$Survived)
+train_base_qda$Embarked <- factor(train_base_qda$Embarked) #doesn't help
+train_base_qda$Pclass <- factor(train_base_qda$Pclass)
+train_base_qda$FamilySize <- factor(train_base_qda$FamilySize) #doesn't help
+
+#check tuning
+train_qda <- train(Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare + Mother + Father + LoneChild + LoneTravel + Unmarried, data = train_base_qda, method = "qda")
+
+train_qda$finalModel
+```
+
+This is some great information! We're going to focus in on the biggest swings in information here, so we'll use Father, Mother, Sex, Pclass, LoneTravel, Unmarried, and see if that gives us a big swing in accuracy.
+
+##  Section 6: Comparing Models & Tuning parameters
+
+#### GLM
+
+```{r}
+
+test_glm <- glm(Survived ~ Age + factor(Pclass) + Sex + SibSp + Embarked + LoneChild + LoneTravel, data = train_set, family = binomial)
+
+
+survived_hat_glm <- predict(test_glm, test_set, type = "response")
+survived_pred_glm <- factor(ifelse(survived_hat_glm > 0.5, 1, 0))
+confusionMatrix(survived_pred_glm, factor(test_set$Survived))
+```
+
+Pretty good! Accuracy of 0.8072. Very promising.
+
+#### KNN
+
+```{r}
+test_knn <- train(Survived ~ Age + factor(Pclass) + Sex + SibSp + Parch + LoneTravel + Unmarried, method = "knn", data = train_set, tuneGrid = data.frame(k = 9))
+
+survived_hat_knn <- predict(test_knn, test_set, type = "raw")
+survived_pred_knn <- factor(ifelse(survived_hat_knn > 0.5, 1, 0))
+confusionMatrix(survived_pred_knn, factor(test_set$Survived))
+```
+
+Oof, an accuracy of 0.6861. We'll still submit it and see what the real value is but I don't think this one goes in the ensemble.
+
+#### Decision Tree
+
+```{r}
+test_dt <- train(Survived ~ Age + factor(Pclass) + Sex + SibSp + Parch + LoneTravel + Unmarried, method = "rpart", data = train_set, tuneGrid = data.frame(cp = 0.021))
+
+survived_hat_dt <- predict(test_dt, test_set, type = "raw")
+survived_pred_dt <- factor(ifelse(survived_hat_dt > 0.5, 1, 0))
+confusionMatrix(survived_pred_dt, factor(test_set$Survived))
+
+```
+
+Accuracy of 0.7848... not great, not terrible.
+
+#### Random Forest
+
+```{r}
+test_rf <- train(Survived ~ factor(Pclass) + Sex + Age + SibSp + Parch + Fare + Embarked + Mother + Father + LoneChild + LoneTravel + Unmarried + FamilySize, method = "rf", tuneGrid = expand.grid(mtry = 3), data = train_base, trControl = trainControl(method = "cv", number = 3))
+
+survived_hat_rf <- predict(test_rf, test_set, type = "raw")
+survived_pred_rf <- factor(ifelse(survived_hat_rf > 0.5, 1, 0))
+confusionMatrix(survived_pred_rf, factor(test_set$Survived))
+```
+
+An accuracy of 0.8767 is exciting but I'm very suspicious that I'm overfitting this and it will tank on the submission.
+
+#### QDA
+
+```{r}
+test_qda <- train(Survived ~ factor(Pclass) + Sex + Mother + Father + LoneTravel + Unmarried, data = train_base_qda, method = "qda")
+
+survived_hat_qda <- predict(test_qda, test_set, type = "raw")
+confusionMatrix(survived_hat_qda, factor(test_set$Survived))
+```
+
+Another 0.8049, very suspicious.
+
+##  Section 7: Prediction
+
+**0.76555** is our score to beat.
+
+#### GLM
+
+```{r}
+survived_test_glm <- (predict(test_glm, test_base, type = "response")) 
+submission_glm <- test_base %>%   
+  select(PassengerId) %>%   
+  mutate(Survived = factor(ifelse(survived_test_glm > 0.5, 1, 0))) 
+
+write.csv(submission_glm, 'submission_glm.csv', row.names = FALSE)
+```
+
+This submission got a **0.76315**. Not too bad.
+
+\
+KNN
+
+```{r}
+survived_test_knn <- (predict(test_knn, test_base, type = "raw")) 
+submission_knn <- test_base %>%   
+  select(PassengerId) %>%   
+  mutate(Survived = factor(ifelse(survived_test_knn > 0.5, 1, 0))) 
+
+write.csv(submission_knn, 'submission_knn.csv', row.names = FALSE)
+```
+
+Not too surprising that this did not do well. **0.65550**
+
+#### Decision Tree
+
+```{r}
+survived_test_dt <- (predict(test_dt, test_base, type = "raw")) 
+submission_dt <- test_base %>%   
+  select(PassengerId) %>%   
+  mutate(Survived = factor(ifelse(survived_test_dt > 0.5, 1, 0))) 
+
+write.csv(submission_dt, 'submission_dt.csv', row.names = FALSE)
+```
+
+**0.77033**. Just barely better than the gender_submission.
+
+#### Random Forest
+
+```{r}
+survived_test_rf <- (predict(test_rf, test_base, type = "raw")) 
+submission_rf <- test_base %>%   
+  select(PassengerId) %>%   
+  mutate(Survived = factor(ifelse(survived_test_rf > 0.5, 1, 0))) 
+
+write.csv(submission_rf, 'submission_rf.csv', row.names = FALSE)
+```
+
+**0.77990** is much much less than the projected 90%, very sad, but it does show that it was overfitting to the test data.
+
+#### QDA
+
+```{r}
+survived_test_qda <- (predict(test_qda, test_base, type = "raw")) 
+submission_qda <- test_base %>%   
+  select(PassengerId) %>%
+  mutate(Survived = survived_test_qda)
+
+write.csv(submission_qda, 'submission_qda.csv', row.names = FALSE)
+```
+
+Submission accuracy of **0.75837**, so again we overfit pretty hard.
+
+Any models that performed in the neighborhood of the **0.76555** baseline of the gender_submission file will get blended into an Ensemble. I am excluding QDA because it is already factorized and harder to average in. We will be using the GLM, RF, and DT outcomes.
+
+#### Ensemble
+
+```{r}
+
+survived_ensemble <- rowMeans(cbind(survived_test_glm, survived_test_rf, survived_test_dt))
+
+
+submission_ensemble <- test_base %>%   
+  select(PassengerId) %>%   
+  mutate(Survived = factor(ifelse(survived_ensemble > 0.5, 1, 0))) 
+
+write.csv(submission_ensemble, 'submission_ensemble.csv', row.names = FALSE)
+
+
+```
+
+An incredible **0.78708**! The ensemble has given the best performance yet. (The first one, not the second run after fixing an NA, so I'm using the better one).
+
+This places me at position #2006 on the leaderboard as of the time of this writing, under the username Teoshen.
+
+You can view this on my github as well, <https://github.com/Teoshen/TitanicML/tree/main>
